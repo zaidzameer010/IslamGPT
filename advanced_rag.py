@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import dotenv
+from typing import Dict, Any
 
 from agno.agent import Agent
 from agno.embedder.ollama import OllamaEmbedder
@@ -9,7 +10,7 @@ from agno.knowledge.pdf import PDFKnowledgeBase
 from agno.knowledge.combined import CombinedKnowledgeBase
 from agno.models.openai import OpenAIChat
 from agno.storage.sqlite import SqliteStorage
-from agno.vectordb.lancedb import LanceDb, SearchType
+from agno.vectordb.qdrant import Qdrant
 from agno.tools.calculator import CalculatorTools
 from agno.document.chunking.agentic import AgenticChunking
 
@@ -29,15 +30,15 @@ def load_env_config():
         "llm_model": os.getenv("LLM_MODEL"),
         "embedding_model": os.getenv("EMBEDDING_MODEL"),
         "embedding_dimensions": int(os.getenv("EMBEDDING_DIMENSIONS")),
+        "qdrant_url": os.getenv("QDRANT_URL", "http://localhost:6333"),
+        "force_reindex": os.getenv("FORCE_REINDEX", "false").lower() in ("true", "1", "yes"),
     }
 
 # Load initial config
 config = load_env_config()
 
-# Create data directories if they don't exist
-os.makedirs("data/text", exist_ok=True)
-os.makedirs("data/pdf", exist_ok=True)
-os.makedirs("lancedb", exist_ok=True)  # Create LanceDB directory if it doesn't exist
+# Create data directory if it doesn't exist
+os.makedirs("data", exist_ok=True)
 
 # Initialize agent with the current configuration
 def create_agent(config):
@@ -50,59 +51,62 @@ def create_agent(config):
     )
 
     # Create agentic chunking strategy with proper LLM configuration
-    agentic_chunking = AgenticChunking(
-        model=OpenAIChat(id=config["llm_model"]),  # Use the same model for chunking
-        max_chunk_size=5000,  # The maximum size of each chunk
+    agentic_cunking = AgenticChunking(
+        model=OpenAIChat(id=config["llm_model"]),
+        max_chunk_size=5000,
     )
 
     # Create knowledge base for text files
     text_knowledge = TextKnowledgeBase(
-        path=Path("data/text"),
-        vector_db=LanceDb(
-            uri="lancedb",
-            table_name="text_knowledge",
-            search_type=SearchType.hybrid,
+        path=Path("data"),  # Use the root data folder
+        vector_db=Qdrant(
+            collection="text_knowledge",
+            url=config["qdrant_url"],
             embedder=local_embedder,
         ),
-        chunking_strategy=agentic_chunking,  # Add agentic chunking
+        chunking_strategy=agentic_cunking,  # Add agentic chunking
+        file_pattern="**/*.txt",  # Only process text files
+        upsert=True,  # Enable upsert to prevent reindexing on every run
     )
 
     # Create knowledge base for PDF files
     pdf_knowledge = PDFKnowledgeBase(
-        path=Path("data/pdf"),
-        vector_db=LanceDb(
-            uri="lancedb",
-            table_name="pdf_knowledge",
-            search_type=SearchType.hybrid,
+        path=Path("data"),  # Use the root data folder
+        vector_db=Qdrant(
+            collection="pdf_knowledge",
+            url=config["qdrant_url"],
             embedder=local_embedder,
         ),
-        chunking_strategy=agentic_chunking,  # Add agentic chunking
+        chunking_strategy=agentic_cunking,  # Add agentic chunking
+        file_pattern="**/*.pdf",  # Only process PDF files
+        upsert=True,  # Enable upsert to prevent reindexing on every run
     )
 
     # Combine knowledge bases
     combined_knowledge = CombinedKnowledgeBase(
         sources=[text_knowledge, pdf_knowledge],
-        vector_db=LanceDb(
-            uri="lancedb",
-            table_name="combined_knowledge",
-            search_type=SearchType.hybrid,
+        vector_db=Qdrant(
+            collection="combined_knowledge",
+            url=config["qdrant_url"],
             embedder=local_embedder,
         ),
+        upsert=True,  # Enable upsert to prevent reindexing on every run
     )
 
     # Create the advanced RAG agent
     return Agent(
         name="AdvancedRAG",
         model=OpenAIChat(id=config["llm_model"]),
-        description="I am an advanced RAG assistant that searches through local knowledge sources to provide comprehensive answers.",
+        description="You are an advanced RAG assistant that searches through knowledge sources to provide accurate answers.",
         instructions=[
             "Search your knowledge base thoroughly before answering questions.",
-            "Only use information from the local knowledge base in the data folder.",
-            "Do not use web search or external information sources.",
+            "Only use information from the provided knowledge base.",
             "Cite your sources clearly when providing information.",
             "If information is not available in your knowledge base, acknowledge the limitations of your knowledge.",
-            "Use the calculator for numerical computations when needed.",
             "Provide detailed, well-structured responses with proper formatting.",
+            "talk like a natural chatbot with natual tone",
+            "you can give your own opinion and thoughts on the topic when asked, but always cite your sources",\
+            "while giving teh answer don't say 'this is what i found from the knowledgebase', 'here is the answer from the knowledgebase, give the answer as it is part of your knowledgebase', just give the answer"
         ],
         knowledge=combined_knowledge,
         tools=[
@@ -116,6 +120,7 @@ def create_agent(config):
         reasoning=True,  # Enable reasoning by default
         reasoning_model=OpenAIChat(id=config["llm_model"]),  # Use the same model for reasoning
         structured_outputs=True,  # Enable structured outputs
+        show_tool_calls=False,  # Disable showing tool calls in responses
     )
 
 # Create the initial agent
@@ -127,6 +132,110 @@ class AdvancedRAGApp:
         self.agent = agent
         self.loaded = False
         self.config = config
+        self.collections_metadata = self._get_collections_metadata()
+
+    def _get_collections_metadata(self) -> Dict[str, Dict[str, Any]]:
+        """Get metadata about Qdrant collections to check if they exist"""
+        collections = {}
+        try:
+            # Get collections info from each knowledge source
+            for source in self.agent.knowledge.sources:
+                vector_db = source.vector_db
+                if hasattr(vector_db, 'qdrant_client'):
+                    collection_name = vector_db.collection
+                    try:
+                        info = vector_db.qdrant_client.get_collection(collection_name=collection_name)
+                        collections[collection_name] = {
+                            "exists": True,
+                            "vectors_count": info.vectors_count,
+                            "status": "ready"
+                        }
+                    except Exception:
+                        collections[collection_name] = {
+                            "exists": False,
+                            "vectors_count": 0,
+                            "status": "not_found"
+                        }
+            
+            # Get combined knowledge collection info
+            if hasattr(self.agent.knowledge, 'vector_db') and hasattr(self.agent.knowledge.vector_db, 'qdrant_client'):
+                collection_name = self.agent.knowledge.vector_db.collection
+                try:
+                    info = self.agent.knowledge.vector_db.qdrant_client.get_collection(collection_name=collection_name)
+                    collections[collection_name] = {
+                        "exists": True,
+                        "vectors_count": info.vectors_count,
+                        "status": "ready"
+                    }
+                except Exception:
+                    collections[collection_name] = {
+                        "exists": False,
+                        "vectors_count": 0,
+                        "status": "not_found"
+                    }
+        except Exception as e:
+            print(f"⚠️ Error getting Qdrant collections metadata: {str(e)}")
+        
+        return collections
+        
+    def _ensure_collections_exist(self):
+        """Ensure that all required Qdrant collections exist without recreating indexes"""
+        try:
+            # Get list of required collection names
+            collection_names = set()
+            for source in self.agent.knowledge.sources:
+                if hasattr(source.vector_db, 'collection'):
+                    collection_names.add(source.vector_db.collection)
+            
+            if hasattr(self.agent.knowledge, 'vector_db') and hasattr(self.agent.knowledge.vector_db, 'collection'):
+                collection_names.add(self.agent.knowledge.vector_db.collection)
+            
+            # Check for any existing qdrant client
+            qdrant_client = None
+            for source in self.agent.knowledge.sources:
+                if hasattr(source.vector_db, 'qdrant_client'):
+                    qdrant_client = source.vector_db.qdrant_client
+                    break
+            
+            if not qdrant_client and hasattr(self.agent.knowledge, 'vector_db') and hasattr(self.agent.knowledge.vector_db, 'qdrant_client'):
+                qdrant_client = self.agent.knowledge.vector_db.qdrant_client
+            
+            if not qdrant_client:
+                print("⚠️ Could not find a qdrant client instance")
+                return
+            
+            # Get existing collections
+            existing_collections = set()
+            try:
+                existing_collections = set(c.name for c in qdrant_client.get_collections().collections)
+            except Exception as e:
+                print(f"⚠️ Error getting existing collections: {str(e)}")
+            
+            # Create missing collections with default schema that matches the embedder dimensions
+            for collection_name in collection_names:
+                if collection_name not in existing_collections:
+                    print(f"Creating missing collection: {collection_name}")
+                    dimension = self.config.get("embedding_dimensions", 1024)
+                    
+                    try:
+                        # Get any vector_db with this collection name to get embedder dimensions
+                        for source in self.agent.knowledge.sources:
+                            if hasattr(source.vector_db, 'collection') and source.vector_db.collection == collection_name and hasattr(source.vector_db, 'embedder'):
+                                if hasattr(source.vector_db.embedder, 'dimensions'):
+                                    dimension = source.vector_db.embedder.dimensions
+                                    break
+                        
+                        # Create the collection with basic settings
+                        from qdrant_client.models import VectorParams, Distance
+                        qdrant_client.create_collection(
+                            collection_name=collection_name,
+                            vectors_config=VectorParams(size=dimension, distance=Distance.COSINE)
+                        )
+                        print(f"✅ Created collection {collection_name} with dimension {dimension}")
+                    except Exception as e:
+                        print(f"⚠️ Error creating collection {collection_name}: {str(e)}")
+        except Exception as e:
+            print(f"⚠️ Error ensuring collections exist: {str(e)}")
 
     def reload_config(self):
         """Reload environment variables and recreate the agent with new config"""
@@ -134,15 +243,87 @@ class AdvancedRAGApp:
         self.config = load_env_config()
         self.agent = create_agent(self.config)
         self.loaded = False
+        self.collections_metadata = self._get_collections_metadata()
         print("Environment configuration reloaded successfully!")
         print(f"Current config: LLM={self.config['llm_model']}, Embedder={self.config['embedding_model']}")
         
     def load_knowledge(self, recreate: bool = False):
-        """Load all knowledge bases"""
-        print("Loading knowledge base...")
-        self.agent.knowledge.load(recreate=recreate)
-        self.loaded = True
-        print("Knowledge base loaded successfully!")
+        """Load all knowledge bases
+        
+        Args:
+            recreate: If True, forces complete reindexing of all files.
+                     If False (default), uses existing index if available.
+        """
+        print("\n📚 Loading knowledge base...")
+        
+        # Override recreate with environment variable if set
+        if self.config.get("force_reindex", False):
+            recreate = True
+            print("⚠️ FORCE_REINDEX environment variable is set to true - forcing reindex")
+        
+        # Ensure collections exist first
+        if not recreate:
+            self._ensure_collections_exist()
+            
+        # Check if collections exist in Qdrant before deciding how to load
+        self.collections_metadata = self._get_collections_metadata()  # Refresh metadata
+        
+        # Debug: print collection statuses
+        print("📊 Qdrant collections status:")
+        for name, metadata in self.collections_metadata.items():
+            status = "✅ Ready" if metadata.get("exists", False) else "❌ Not Found"
+            count = metadata.get("vectors_count", 0)
+            print(f"  - {name}: {status}, {count} vectors")
+            
+        all_collections_exist = all(meta.get("exists", False) for meta in self.collections_metadata.values())
+        collections_have_data = any(meta.get("vectors_count", 0) > 0 for meta in self.collections_metadata.values())
+        
+        # If requested to recreate or no collections exist, do a full reindex
+        if recreate or not all_collections_exist:
+            if recreate:
+                reason = "Full reindex requested"
+            else:
+                reason = "Some Qdrant collections missing"
+            
+            print(f"🔄 {reason} - rebuilding entire knowledge base...")
+            self.agent.knowledge.load(recreate=True, upsert=True)
+            self.loaded = True
+            
+            # Refresh collection metadata after loading
+            self.collections_metadata = self._get_collections_metadata()
+            print("✅ Knowledge base completely rebuilt and loaded!")
+            return
+        
+        # If collections have data, just load without recreating
+        if collections_have_data:
+            print("✨ Using existing Qdrant index...")
+            try:
+                # Just load the existing database without reprocessing
+                self.agent.knowledge.load(recreate=False, upsert=True)
+                self.loaded = True
+                print("✅ Knowledge base loaded from existing Qdrant index!")
+                return
+            except Exception as e:
+                print(f"⚠️ Error loading existing index: {str(e)}")
+                print("🔄 Rebuilding index as fallback only because of error...")
+                self.agent.knowledge.load(recreate=True, upsert=True)
+                self.loaded = True
+                print("✅ Knowledge base rebuilt completely due to loading error!")
+                return
+        else:
+            # No data in collections - need to initialize
+            print("🔄 Qdrant collections exist but are empty. Initializing knowledge base...")
+            try:
+                # Try to use upsert mode for the initial load
+                self.agent.knowledge.load(recreate=False, upsert=True)
+                self.loaded = True
+                print("✅ Knowledge base initialized with upsert mode!")
+            except Exception as e:
+                print(f"⚠️ Upsert mode failed: {str(e)}")
+                print("🔄 Falling back to recreate mode...")
+                self.agent.knowledge.load(recreate=True, upsert=True)
+                self.loaded = True
+                print("✅ Knowledge base initialized with recreate mode!")
 
     def query(
         self, question: str, stream: bool = True, show_reasoning: bool = True
@@ -150,7 +331,7 @@ class AdvancedRAGApp:
         """Query the RAG system with a question"""
         if not self.loaded:
             print("Knowledge base not loaded. Loading now...")
-            self.load_knowledge()
+            self.load_knowledge(recreate=False)  # Explicitly set recreate=False here
 
         print(f"Querying: {question}")
         try:
@@ -174,15 +355,66 @@ class AdvancedRAGApp:
 
     def add_text_document(self, content: str, filename: str):
         """Add a text document to the knowledge base"""
-        filepath = Path(f"data/text/{filename}")
+        if not filename.endswith('.txt'):
+            filename += '.txt'
+            
+        filepath = Path(f"data/{filename}")
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
 
-        # Reload the knowledge base
+        # Process the new file
         print(f"Adding text document: {filename}")
         print("This will use agentic chunking to process the document...")
-        self.agent.knowledge.load(recreate=False)
-        print(f"Added text document: {filename}")
+        
+        try:
+            # Add only the new document to the knowledge base
+            self.agent.knowledge.sources[0].add_document(filepath)
+            
+            # Update the combined knowledge if needed
+            if hasattr(self.agent.knowledge, 'update_from_sources'):
+                self.agent.knowledge.update_from_sources()
+                
+            print(f"Added text document: {filename}")
+        except Exception as e:
+            print(f"Error adding document: {str(e)}")
+            print("Falling back to full reload without reindexing...")
+            self.agent.knowledge.load(recreate=False, upsert=True)  # Explicitly set recreate=False and upsert=True
+            print(f"Added text document: {filename} (via full reload)")
+
+    def add_pdf_document(self, filepath: str):
+        """Add a PDF document to the knowledge base by copying it to the data directory"""
+        source_path = Path(filepath)
+        if not source_path.exists():
+            print(f"Error: File {filepath} does not exist")
+            return
+
+        if not source_path.suffix.lower() == ".pdf":
+            print(f"Error: File {filepath} is not a PDF")
+            return
+
+        dest_path = Path(f"data/{source_path.name}")
+
+        # Copy the file
+        import shutil
+        shutil.copy2(source_path, dest_path)
+
+        # Process the new file
+        print(f"Adding PDF document: {source_path.name}")
+        
+        try:
+            # Add only the new document to the knowledge base
+            self.agent.knowledge.sources[1].add_document(dest_path)
+            
+            # Update the combined knowledge if needed
+            if hasattr(self.agent.knowledge, 'update_from_sources'):
+                self.agent.knowledge.update_from_sources()
+                
+            print(f"Added PDF document: {source_path.name}")
+        except Exception as e:
+            print(f"Error adding document: {str(e)}")
+            print("Falling back to full reload without reindexing...")
+            self.agent.knowledge.load(recreate=False, upsert=True)  # Explicitly set recreate=False and upsert=True
+            print(f"Added PDF document: {source_path.name} (via full reload)")
 
     def verify_chunking(self):
         """Verify that agentic chunking is working correctly"""
@@ -198,28 +430,6 @@ class AdvancedRAGApp:
         except Exception as e:
             print(f"Error verifying chunking: {str(e)}")
             return False
-
-    def add_pdf_document(self, filepath: str):
-        """Add a PDF document to the knowledge base by copying it to the data/pdf directory"""
-        source_path = Path(filepath)
-        if not source_path.exists():
-            print(f"Error: File {filepath} does not exist")
-            return
-
-        if not source_path.suffix.lower() == ".pdf":
-            print(f"Error: File {filepath} is not a PDF")
-            return
-
-        dest_path = Path(f"data/pdf/{source_path.name}")
-
-        # Copy the file
-        import shutil
-
-        shutil.copy2(source_path, dest_path)
-
-        # Reload the knowledge base
-        self.agent.knowledge.load(recreate=False)
-        print(f"Added PDF document: {source_path.name}")
 
     def enable_reasoning(self, enable: bool = True):
         """Enable or disable reasoning mode for the agent"""
@@ -250,6 +460,20 @@ class AdvancedRAGApp:
                 self.agent.reasoning = False
             return "Error processing your reasoning query. Please try again or check the logs for details."
 
+    def show_collection_stats(self):
+        """Show statistics about the Qdrant collections"""
+        print("\n📊 Qdrant Collection Statistics:")
+        self.collections_metadata = self._get_collections_metadata()
+        
+        if not self.collections_metadata:
+            print("No Qdrant collections found or unable to retrieve statistics.")
+            return
+        
+        for collection_name, metadata in self.collections_metadata.items():
+            status = "✅ Ready" if metadata.get("exists", False) else "❌ Not Found"
+            count = metadata.get("vectors_count", 0)
+            print(f"  - {collection_name}: {status}, {count} vectors")
+
 
 if __name__ == "__main__":
     # Initialize the RAG application
@@ -271,6 +495,7 @@ if __name__ == "__main__":
     print("  !verify - Verify agentic chunking implementation")
     print("  !reload - Reload environment variables and reconfigure agent")
     print("  !config - Show current configuration")
+    print("  !stats - Show Qdrant collection statistics")
     print("  exit/quit/q - Exit the application")
 
     # Interactive query loop
@@ -321,6 +546,10 @@ if __name__ == "__main__":
             print(f"  Embedding Model: {rag_app.config['embedding_model']}")
             print(f"  Embedding Dimensions: {rag_app.config['embedding_dimensions']}")
             print(f"  Ollama URL: {rag_app.config['ollama_url']}")
+            print(f"  Qdrant URL: {rag_app.config['qdrant_url']}")
+        elif user_input == "!stats":
+            # Show Qdrant collection statistics
+            rag_app.show_collection_stats()
         else:
             # Regular query
             rag_app.query(user_input)

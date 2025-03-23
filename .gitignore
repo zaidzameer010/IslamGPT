@@ -1,5 +1,3 @@
-.env
-lancedb
 data
 advanced_rag.db
-
+.cache

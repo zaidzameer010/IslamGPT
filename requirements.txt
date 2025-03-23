@@ -1,0 +1,8 @@
+agno
+qdrant-client
+python-dotenv
+openai
+llama-index
+llama-index-llms-openai
+llama-index-embeddings-ollama
+httpx

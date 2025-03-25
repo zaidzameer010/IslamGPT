@@ -12,7 +12,7 @@ from agno.knowledge.pdf import PDFKnowledgeBase
 from agno.knowledge.combined import CombinedKnowledgeBase
 from agno.models.openai import OpenAIChat 
 from agno.storage.sqlite import SqliteStorage
-from agno.document.chunking.agentic import AgenticChunking
+from agno.document.chunking.fixed import FixedSizeChunking
 from agno.vectordb.qdrant import Qdrant  # Fixed import name
 
 # Function to load environment variables
@@ -30,7 +30,7 @@ def load_env_config():
         "ollama_url": os.getenv("OLLAMA_URL"),
         "llm_model": os.getenv("LLM_MODEL"),
         "embedding_model": os.getenv("EMBEDDING_MODEL"),
-        "embedding_dimensions": int(os.getenv("EMBEDDING_DIMENSIONS")),
+        "embedding_dimensions": int(os.getenv("EMBEDDING_DIMENSIONS", 1024)),
         "qdrant_url": os.getenv("QDRANT_URL", "http://localhost:6333"),
         "IslamGPT": os.getenv("QDRANT_COLLECTION"),
     }
@@ -148,70 +148,110 @@ class AdvancedRAGApp:
             file_extension = os.path.splitext(filepath)[1].lower()
             
             if file_extension == '.pdf':
-                # Handle PDF file
-                try:
-                    with open(filepath, 'rb') as f:
-                        pdf_content = f.read()
-                    
-                    # Create a temporary file to process the PDF
-                    import tempfile
-                    
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
-                        temp_pdf.write(pdf_content)
-                        temp_pdf_path = temp_pdf.name
-                    
+                # Handle PDF file directly
+                from agno.knowledge.pdf import PDFKnowledgeBase
+                
+                # Use fixed size chunking with smaller chunks and overlap
+                chunking_strategy = FixedSizeChunking(
+                    chunk_size=3000,  # Smaller chunk size
+                    overlap=100,      # Some overlap between chunks
+                )
+                
+                temp_kb = PDFKnowledgeBase(
+                    path=filepath,
+                    vector_db=self.agent.knowledge.vector_db,
+                    chunking_strategy=chunking_strategy,
+                    metadata=[{
+                        'type': 'pdf',
+                        'filename': os.path.basename(filepath),
+                        **(metadata or {})
+                    }]
+                )
+                
+                # Process and add to Qdrant with retries
+                max_retries = 3
+                for attempt in range(max_retries):
                     try:
-                        # Create a temporary PDFKnowledgeBase for processing this content
-                        from agno.knowledge.pdf import PDFKnowledgeBase
-                        from agno.document.chunking.agentic import AgenticChunking
-                        
-                        temp_kb = PDFKnowledgeBase(
-                            files=[temp_pdf_path],
-                            vector_db=self.agent.knowledge.vector_db,
-                            chunking_strategy=AgenticChunking(),
-                            metadata=[{
-                                'type': 'pdf',
-                                'filename': os.path.basename(filepath),
-                                **(metadata or {})
-                            }]
-                        )
-                    finally:
-                        # Clean up temporary file
-                        os.unlink(temp_pdf_path)
-                        
-                except Exception as e:
-                    print(f"Error processing PDF file: {str(e)}")
-                    return False
+                        temp_kb.load(recreate=False, upsert=True)
+                        print(f"PDF file {filepath} added successfully to Qdrant!")
+                        return True
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            print(f"Attempt {attempt + 1} failed, retrying...")
+                            continue
+                        raise
                     
             elif file_extension == '.txt':
                 # Handle text file
                 from agno.knowledge.text import TextKnowledgeBase
-                from agno.document.chunking.agentic import AgenticChunking
+                
+                # Use fixed size chunking with smaller chunks and overlap
+                chunking_strategy = FixedSizeChunking(
+                    chunk_size=3000,  # Smaller chunk size
+                    overlap=100,      # Some overlap between chunks
+                )
                 
                 temp_kb = TextKnowledgeBase(
                     path=filepath,
                     vector_db=self.agent.knowledge.vector_db,
-                    chunking_strategy=AgenticChunking(),
+                    chunking_strategy=chunking_strategy,
                     metadata=[{
                         'type': 'text',
                         'filename': os.path.basename(filepath),
                         **(metadata or {})
                     }]
                 )
+                
+                # Process and add to Qdrant with retries
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        temp_kb.load(recreate=False, upsert=True)
+                        print(f"Text file {filepath} added successfully to Qdrant!")
+                        return True
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            print(f"Attempt {attempt + 1} failed, retrying...")
+                            continue
+                        raise
             else:
                 print(f"Unsupported file type: {file_extension}")
                 return False
-            
-            # Process and add to Qdrant through Agno's pipeline
-            temp_kb.load(recreate=False, upsert=True)
-            print(f"File {filepath} added successfully to Qdrant!")
-            return True
             
         except FileNotFoundError:
             print(f"Error: File {filepath} not found")
             return False
         except Exception as e:
             print(f"Error adding file to Qdrant: {str(e)}")
+            return False
+
+    def add_folder(self, folder_path: str, metadata: dict = None):
+        """Add all text and PDF files from a folder to the knowledge base"""
+        print(f"Processing files from folder: {folder_path}")
+        try:
+            # Check if folder exists
+            if not os.path.isdir(folder_path):
+                raise ValueError(f"Folder path does not exist: {folder_path}")
+
+            # Walk through the directory
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    file_extension = os.path.splitext(file)[1].lower()
+                    
+                    # Process only .txt and .pdf files
+                    if file_extension in ['.txt', '.pdf']:
+                        try:
+                            self.addfiles(file_path, metadata)
+                            print(f"Successfully processed: {file_path}")
+                        except Exception as e:
+                            print(f"Error processing file {file_path}: {str(e)}")
+                            continue
+
+            print(f"Finished processing all files in {folder_path}")
+            return True
+        except Exception as e:
+            print(f"Error processing folder: {str(e)}")
             return False
 
 if __name__ == "__main__":
@@ -224,6 +264,7 @@ if __name__ == "__main__":
     print("\n=== Advanced RAG System Ready ===\n")
     print("Available commands:")
     print("  !addfile filepath - Add text or PDF file directly to Qdrant")
+    print("  !addfolder folderpath - Add all text and PDF files from a folder to Qdrant")
     print("  !reload - Reload environment variables and reconfigure agent")
     print("  !config - Show current configuration")
     print("  exit/quit/q - Exit the application")
@@ -240,6 +281,11 @@ if __name__ == "__main__":
             filepath = user_input[9:].strip()
             metadata = {'source': 'user_upload', 'timestamp': str(datetime.now())}
             rag_app.addfiles(filepath, metadata)
+        elif user_input.startswith("!addfolder "):
+            # Format: !addfolder folderpath
+            folder_path = user_input[11:].strip()
+            metadata = {'source': 'user_upload', 'timestamp': str(datetime.now())}
+            rag_app.add_folder(folder_path, metadata)
         elif user_input == "!reload":
             # Reload environment configuration
             rag_app.reload_config()

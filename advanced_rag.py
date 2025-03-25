@@ -4,6 +4,8 @@ import dotenv
 from qdrant_client import QdrantClient
 from datetime import datetime
 import uuid
+import time
+import threading
 
 from agno.agent import Agent
 from agno.embedder.ollama import OllamaEmbedder
@@ -13,13 +15,13 @@ from agno.knowledge.combined import CombinedKnowledgeBase
 from agno.models.openai import OpenAIChat 
 from agno.storage.sqlite import SqliteStorage
 from agno.document.chunking.fixed import FixedSizeChunking
-from agno.vectordb.qdrant import Qdrant  # Fixed import name
+from agno.vectordb.qdrant import Qdrant  
 
 # Function to load environment variables
 def load_env_config():
     """Load or reload environment variables from .env file and return config values"""
     # Load environment variables from .env file
-    dotenv.load_dotenv(override=True)  # Use override=True to force reload
+    dotenv.load_dotenv(override=True)  
 
     # Set OpenAI API key and base URL from environment variables
     os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
@@ -58,7 +60,7 @@ def create_agent(config):
 
     # Create unified knowledge base using only Qdrant
     IslamGPT = CombinedKnowledgeBase(
-        sources=[],  # No local file sources
+        sources=[],  
         vector_db=Qdrant(
             collection=os.getenv("QDRANT_COLLECTION"),
             url=config["qdrant_url"],
@@ -143,6 +145,22 @@ class AdvancedRAGApp:
     def addfiles(self, filepath: str, metadata: dict = None):
         """Add text or PDF files directly to Qdrant using Agno's document processing"""
         print(f"Adding file {filepath} to Qdrant...")
+        start_time = time.time()
+        processing = {'active': True}  # Use dict for mutable state in threads
+        
+        def show_progress():
+            """Show progress indicator with elapsed time"""
+            while processing['active']:
+                elapsed = time.time() - start_time
+                print(f"\rProcessing... Time elapsed: {elapsed:.1f} seconds", end='', flush=True)
+                time.sleep(1)
+            print()  # New line after processing is done
+        
+        # Start progress thread
+        progress_thread = threading.Thread(target=show_progress)
+        progress_thread.daemon = True
+        progress_thread.start()
+        
         try:
             # Determine file type based on extension
             file_extension = os.path.splitext(filepath)[1].lower()
@@ -153,8 +171,8 @@ class AdvancedRAGApp:
                 
                 # Use fixed size chunking with smaller chunks and overlap
                 chunking_strategy = FixedSizeChunking(
-                    chunk_size=3000,  # Smaller chunk size
-                    overlap=100,      # Some overlap between chunks
+                    chunk_size=3000,
+                    overlap=100,
                 )
                 
                 temp_kb = PDFKnowledgeBase(
@@ -173,11 +191,15 @@ class AdvancedRAGApp:
                 for attempt in range(max_retries):
                     try:
                         temp_kb.load(recreate=False, upsert=True)
-                        print(f"PDF file {filepath} added successfully to Qdrant!")
+                        processing['active'] = False  # Stop progress thread
+                        progress_thread.join()  # Wait for thread to finish
+                        elapsed_time = time.time() - start_time
+                        print(f"\nPDF file {filepath} added successfully to Qdrant!")
+                        print(f"Total time taken: {elapsed_time:.2f} seconds")
                         return True
                     except Exception as e:
                         if attempt < max_retries - 1:
-                            print(f"Attempt {attempt + 1} failed, retrying...")
+                            print(f"\nAttempt {attempt + 1} failed, retrying...")
                             continue
                         raise
                     
@@ -187,8 +209,8 @@ class AdvancedRAGApp:
                 
                 # Use fixed size chunking with smaller chunks and overlap
                 chunking_strategy = FixedSizeChunking(
-                    chunk_size=3000,  # Smaller chunk size
-                    overlap=100,      # Some overlap between chunks
+                    chunk_size=3000,
+                    overlap=100,
                 )
                 
                 temp_kb = TextKnowledgeBase(
@@ -207,31 +229,54 @@ class AdvancedRAGApp:
                 for attempt in range(max_retries):
                     try:
                         temp_kb.load(recreate=False, upsert=True)
-                        print(f"Text file {filepath} added successfully to Qdrant!")
+                        processing['active'] = False  # Stop progress thread
+                        progress_thread.join()  # Wait for thread to finish
+                        elapsed_time = time.time() - start_time
+                        print(f"\nText file {filepath} added successfully to Qdrant!")
+                        print(f"Total time taken: {elapsed_time:.2f} seconds")
                         return True
                     except Exception as e:
                         if attempt < max_retries - 1:
-                            print(f"Attempt {attempt + 1} failed, retrying...")
+                            print(f"\nAttempt {attempt + 1} failed, retrying...")
                             continue
                         raise
             else:
-                print(f"Unsupported file type: {file_extension}")
+                processing['active'] = False  # Stop progress thread
+                progress_thread.join()
+                print(f"\nUnsupported file type: {file_extension}")
                 return False
             
         except FileNotFoundError:
-            print(f"Error: File {filepath} not found")
+            processing['active'] = False  # Stop progress thread
+            progress_thread.join()
+            print(f"\nError: File {filepath} not found")
             return False
         except Exception as e:
-            print(f"Error adding file to Qdrant: {str(e)}")
+            processing['active'] = False  # Stop progress thread
+            progress_thread.join()
+            elapsed_time = time.time() - start_time
+            print(f"\nError adding file to Qdrant: {str(e)}")
+            print(f"Time elapsed before error: {elapsed_time:.2f} seconds")
             return False
 
     def add_folder(self, folder_path: str, metadata: dict = None):
         """Add all text and PDF files from a folder to the knowledge base"""
         print(f"Processing files from folder: {folder_path}")
+        start_time = time.time()  
+        total_files = 0
+        processed_files = 0
         try:
             # Check if folder exists
             if not os.path.isdir(folder_path):
                 raise ValueError(f"Folder path does not exist: {folder_path}")
+
+            # First count total files
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    if os.path.splitext(file)[1].lower() in ['.txt', '.pdf']:
+                        total_files += 1
+
+            print(f"Found {total_files} files to process...")
 
             # Walk through the directory
             for root, _, files in os.walk(folder_path):
@@ -242,16 +287,24 @@ class AdvancedRAGApp:
                     # Process only .txt and .pdf files
                     if file_extension in ['.txt', '.pdf']:
                         try:
+                            file_start_time = time.time()  
                             self.addfiles(file_path, metadata)
-                            print(f"Successfully processed: {file_path}")
+                            file_elapsed_time = time.time() - file_start_time
+                            processed_files += 1
+                            print(f"Progress: {processed_files}/{total_files} files ({(processed_files/total_files)*100:.1f}%)")
                         except Exception as e:
                             print(f"Error processing file {file_path}: {str(e)}")
                             continue
 
+            elapsed_time = time.time() - start_time  
             print(f"Finished processing all files in {folder_path}")
+            print(f"Total time taken: {elapsed_time:.2f} seconds for {processed_files} files")
+            print(f"Average time per file: {(elapsed_time/processed_files if processed_files > 0 else 0):.2f} seconds")
             return True
         except Exception as e:
+            elapsed_time = time.time() - start_time
             print(f"Error processing folder: {str(e)}")
+            print(f"Time elapsed before error: {elapsed_time:.2f} seconds")
             return False
 
 if __name__ == "__main__":
